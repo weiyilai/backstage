@@ -15,47 +15,48 @@
  */
 
 import { ScmIntegrations } from '@backstage/integration';
-import {
-  TaskContext,
-  TaskTrackType,
-  WorkflowResponse,
-  WorkflowRunner,
-} from './types';
+import { TaskTrackType, WorkflowResponse, WorkflowRunner } from './types';
 import * as winston from 'winston';
 import fs from 'fs-extra';
 import path from 'path';
 import nunjucks from 'nunjucks';
 import { JsonArray, JsonObject, JsonValue } from '@backstage/types';
-import { InputError, NotAllowedError } from '@backstage/errors';
+import { InputError, NotAllowedError, stringifyError } from '@backstage/errors';
 import { PassThrough } from 'stream';
 import { generateExampleOutput, isTruthy } from './helper';
 import { validate as validateJsonSchema } from 'jsonschema';
 import { TemplateActionRegistry } from '../actions';
+import { metrics } from '@opentelemetry/api';
 import {
-  TemplateFilter,
   SecureTemplater,
   SecureTemplateRenderer,
-  TemplateGlobal,
 } from '../../lib/templating/SecureTemplater';
 import {
+  TaskRecovery,
   TaskSpec,
   TaskSpecV1beta3,
   TaskStep,
 } from '@backstage/plugin-scaffolder-common';
 
-import { TemplateAction } from '@backstage/plugin-scaffolder-node';
+import {
+  TemplateAction,
+  TemplateFilter,
+  TemplateGlobal,
+  TaskContext,
+} from '@backstage/plugin-scaffolder-node';
 import { createConditionAuthorizer } from '@backstage/plugin-permission-node';
 import { UserEntity } from '@backstage/catalog-model';
 import { createCounterMetric, createHistogramMetric } from '../../util/metrics';
 import { createDefaultFilters } from '../../lib/templating/filters';
 import {
   AuthorizeResult,
-  PermissionEvaluator,
   PolicyDecision,
 } from '@backstage/plugin-permission-common';
 import { scaffolderActionRules } from '../../service/rules';
 import { actionExecutePermission } from '@backstage/plugin-scaffolder-common/alpha';
-import { TaskRecovery } from '@backstage/plugin-scaffolder-common';
+import { PermissionsService } from '@backstage/backend-plugin-api';
+import { loggerToWinstonLogger } from '@backstage/backend-common';
+import { BackstageLoggerTransport, WinstonLogger } from './logger';
 
 type NunjucksWorkflowRunnerOptions = {
   workingDirectory: string;
@@ -64,7 +65,7 @@ type NunjucksWorkflowRunnerOptions = {
   logger: winston.Logger;
   additionalTemplateFilters?: Record<string, TemplateFilter>;
   additionalTemplateGlobals?: Record<string, TemplateGlobal>;
-  permissions?: PermissionEvaluator;
+  permissions?: PermissionsService;
 };
 
 type TemplateContext = {
@@ -79,7 +80,22 @@ type TemplateContext = {
     ref?: string;
   };
   each?: JsonValue;
+  context: {
+    task: {
+      id: string;
+    };
+  };
 };
+
+type CheckpointState =
+  | {
+      status: 'failed';
+      reason: string;
+    }
+  | {
+      status: 'success';
+      value: JsonValue;
+    };
 
 const isValidTaskSpec = (taskSpec: TaskSpec): taskSpec is TaskSpecV1beta3 => {
   return taskSpec.apiVersion === 'scaffolder.backstage.io/v1beta3';
@@ -88,29 +104,37 @@ const isValidTaskSpec = (taskSpec: TaskSpec): taskSpec is TaskSpecV1beta3 => {
 const createStepLogger = ({
   task,
   step,
+  rootLogger,
 }: {
   task: TaskContext;
   step: TaskStep;
+  rootLogger: winston.Logger;
 }) => {
-  const metadata = { stepId: step.id };
-  const taskLogger = winston.createLogger({
+  const taskLogger = WinstonLogger.create({
     level: process.env.LOG_LEVEL || 'info',
     format: winston.format.combine(
       winston.format.colorize(),
       winston.format.simple(),
     ),
-    defaultMeta: {},
+    transports: [new BackstageLoggerTransport(rootLogger, task, step.id)],
   });
 
+  taskLogger.addRedactions(Object.values(task.secrets ?? {}));
+
+  // This stream logger should be deprecated. We're going to replace it with
+  // just using the logger directly, as all those logs get written to step logs
+  // using the stepLogStream above.
+  // Initially this stream used to be the only way to write to the client logs, but that
+  // has changed over time, there's not really a need for this anymore.
+  // You can just create a simple wrapper like the below in your action to write to the main logger.
+  // This way we also get recactions for free.
   const streamLogger = new PassThrough();
   streamLogger.on('data', async data => {
     const message = data.toString().trim();
     if (message?.length > 1) {
-      await task.emitLog(message, metadata);
+      taskLogger.info(message);
     }
   });
-
-  taskLogger.add(new winston.transports.Stream({ stream: streamLogger }));
 
   return { taskLogger, streamLogger };
 };
@@ -225,24 +249,25 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
     }
 
     try {
-      if (step.if) {
-        const ifResult = await this.render(step.if, context, renderTemplate);
-        if (!isTruthy(ifResult)) {
-          await stepTrack.skipFalsy();
-          return;
-        }
+      if (
+        step.if === false ||
+        (typeof step.if === 'string' &&
+          !isTruthy(this.render(step.if, context, renderTemplate)))
+      ) {
+        await stepTrack.skipFalsy();
+        return;
       }
-
       const action: TemplateAction<JsonObject> =
         this.options.actionRegistry.get(step.action);
-      const { taskLogger, streamLogger } = createStepLogger({ task, step });
+      const { taskLogger, streamLogger } = createStepLogger({
+        task,
+        step,
+        rootLogger: this.options.logger,
+      });
 
       if (task.isDryRun) {
         const redactedSecrets = Object.fromEntries(
-          Object.entries(task.secrets ?? {}).map(secret => [
-            secret[0],
-            '[REDACTED]',
-          ]),
+          Object.entries(task.secrets ?? {}).map(secret => [secret[0], '***']),
         );
         const debugInput =
           (step.input &&
@@ -332,6 +357,7 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
       }
       const tmpDirs = new Array<string>();
       const stepOutput: { [outputName: string]: JsonValue } = {};
+      const prevTaskState = await task.getTaskState?.();
 
       for (const iteration of iterations) {
         if (iteration.each) {
@@ -343,12 +369,60 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
             )}`,
           );
         }
+
         await action.handler({
           input: iteration.input,
+          task: {
+            id: await task.getWorkspaceName(),
+          },
           secrets: task.secrets ?? {},
-          logger: taskLogger,
+          // TODO(blam): move to LoggerService and away from Winston
+          logger: loggerToWinstonLogger(taskLogger),
           logStream: streamLogger,
           workspacePath,
+          async checkpoint<T extends JsonValue | void>(opts: {
+            key?: string;
+            fn: () => Promise<T> | T;
+          }) {
+            const { key: checkpointKey, fn } = opts;
+            const key = `v1.task.checkpoint.${step.id}.${checkpointKey}`;
+
+            try {
+              let prevValue: T | undefined;
+
+              if (prevTaskState) {
+                const prevState = (
+                  prevTaskState.state?.checkpoints as {
+                    [key: string]: CheckpointState;
+                  }
+                )?.[key];
+
+                if (prevState && prevState.status === 'success') {
+                  prevValue = prevState.value as T;
+                }
+              }
+
+              const value = prevValue ? prevValue : await fn();
+
+              if (!prevValue) {
+                task.updateCheckpoint?.({
+                  key,
+                  status: 'success',
+                  value: value ?? {},
+                });
+              }
+              return value;
+            } catch (err) {
+              task.updateCheckpoint?.({
+                key,
+                status: 'failed',
+                reason: stringifyError(err),
+              });
+              throw err;
+            } finally {
+              await task.serializeWorkspace?.({ path: workspacePath });
+            }
+          },
           createTemporaryDirectory: async () => {
             const tmpDir = await fs.mkdtemp(
               `${workspacePath}_step-${step.id}-`,
@@ -368,6 +442,7 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
           user: task.spec.user,
           isDryRun: task.isDryRun,
           signal: task.cancelSignal,
+          getInitiatorCredentials: () => task.getInitiatorCredentials(),
         });
       }
 
@@ -387,6 +462,8 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
       await taskTrack.markFailed(step, err);
       await stepTrack.markFailed();
       throw err;
+    } finally {
+      await task.serializeWorkspace?.({ path: workspacePath });
     }
   }
 
@@ -396,10 +473,9 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
         'Wrong template version executed with the workflow engine',
       );
     }
-    const workspacePath = path.join(
-      this.options.workingDirectory,
-      await task.getWorkspaceName(),
-    );
+    const taskId = await task.getWorkspaceName();
+
+    const workspacePath = path.join(this.options.workingDirectory, taskId);
 
     const { additionalTemplateFilters, additionalTemplateGlobals } =
       this.options;
@@ -413,6 +489,8 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
     });
 
     try {
+      await task.rehydrateWorkspace?.({ taskId, targetPath: workspacePath });
+
       const taskTrack = await this.tracker.taskStart(task);
       await fs.ensureDir(workspacePath);
 
@@ -420,13 +498,18 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
         parameters: task.spec.parameters,
         steps: {},
         user: task.spec.user,
+        context: {
+          task: {
+            id: taskId,
+          },
+        },
       };
 
       const [decision]: PolicyDecision[] =
         this.options.permissions && task.spec.steps.length
           ? await this.options.permissions.authorizeConditional(
               [{ permission: actionExecutePermission }],
-              { token: task.secrets?.backstageToken },
+              { credentials: await task.getInitiatorCredentials() },
             )
           : [{ result: AuthorizeResult.ALLOW }];
 
@@ -444,6 +527,7 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
 
       const output = this.render(task.spec.output, context, renderTemplate);
       await taskTrack.markSuccessful();
+      await task.cleanWorkspace?.();
 
       return { output };
     } finally {
@@ -455,25 +539,45 @@ export class NunjucksWorkflowRunner implements WorkflowRunner {
 }
 
 function scaffoldingTracker() {
-  const taskCount = createCounterMetric({
+  // prom-client metrics are deprecated in favour of OpenTelemetry metrics.
+  const promTaskCount = createCounterMetric({
     name: 'scaffolder_task_count',
     help: 'Count of task runs',
     labelNames: ['template', 'user', 'result'],
   });
-  const taskDuration = createHistogramMetric({
+  const promTaskDuration = createHistogramMetric({
     name: 'scaffolder_task_duration',
     help: 'Duration of a task run',
     labelNames: ['template', 'result'],
   });
-  const stepCount = createCounterMetric({
+  const promtStepCount = createCounterMetric({
     name: 'scaffolder_step_count',
     help: 'Count of step runs',
     labelNames: ['template', 'step', 'result'],
   });
-  const stepDuration = createHistogramMetric({
+  const promStepDuration = createHistogramMetric({
     name: 'scaffolder_step_duration',
     help: 'Duration of a step runs',
     labelNames: ['template', 'step', 'result'],
+  });
+
+  const meter = metrics.getMeter('default');
+  const taskCount = meter.createCounter('scaffolder.task.count', {
+    description: 'Count of task runs',
+  });
+
+  const taskDuration = meter.createHistogram('scaffolder.task.duration', {
+    description: 'Duration of a task run',
+    unit: 'seconds',
+  });
+
+  const stepCount = meter.createCounter('scaffolder.step.count', {
+    description: 'Count of step runs',
+  });
+
+  const stepDuration = meter.createHistogram('scaffolder.step.duration', {
+    description: 'Duration of a step runs',
+    unit: 'seconds',
   });
 
   async function taskStart(task: TaskContext) {
@@ -481,9 +585,15 @@ function scaffoldingTracker() {
     const template = task.spec.templateInfo?.entityRef || '';
     const user = task.spec.user?.ref || '';
 
-    const taskTimer = taskDuration.startTimer({
+    const startTime = process.hrtime();
+    const taskTimer = promTaskDuration.startTimer({
       template,
     });
+
+    function endTime() {
+      const delta = process.hrtime(startTime);
+      return delta[0] + delta[1] / 1e9;
+    }
 
     async function skipDryRun(
       step: TaskStep,
@@ -496,12 +606,17 @@ function scaffoldingTracker() {
     }
 
     async function markSuccessful() {
-      taskCount.inc({
+      promTaskCount.inc({
         template,
         user,
         result: 'ok',
       });
       taskTimer({ result: 'ok' });
+
+      taskCount.add(1, { template, user, result: 'ok' });
+      taskDuration.record(endTime(), {
+        result: 'ok',
+      });
     }
 
     async function markFailed(step: TaskStep, err: Error) {
@@ -509,12 +624,17 @@ function scaffoldingTracker() {
         stepId: step.id,
         status: 'failed',
       });
-      taskCount.inc({
+      promTaskCount.inc({
         template,
         user,
         result: 'failed',
       });
       taskTimer({ result: 'failed' });
+
+      taskCount.add(1, { template, user, result: 'failed' });
+      taskDuration.record(endTime(), {
+        result: 'failed',
+      });
     }
 
     async function markCancelled(step: TaskStep) {
@@ -522,12 +642,17 @@ function scaffoldingTracker() {
         stepId: step.id,
         status: 'cancelled',
       });
-      taskCount.inc({
+      promTaskCount.inc({
         template,
         user,
         result: 'cancelled',
       });
       taskTimer({ result: 'cancelled' });
+
+      taskCount.add(1, { template, user, result: 'cancelled' });
+      taskDuration.record(endTime(), {
+        result: 'cancelled',
+      });
     }
 
     return {
@@ -545,40 +670,61 @@ function scaffoldingTracker() {
     });
     const template = task.spec.templateInfo?.entityRef || '';
 
-    const stepTimer = stepDuration.startTimer({
+    const startTime = process.hrtime();
+    const stepTimer = promStepDuration.startTimer({
       template,
       step: step.name,
     });
+
+    function endTime() {
+      const delta = process.hrtime(startTime);
+      return delta[0] + delta[1] / 1e9;
+    }
 
     async function markSuccessful() {
       await task.emitLog(`Finished step ${step.name}`, {
         stepId: step.id,
         status: 'completed',
       });
-      stepCount.inc({
+      promtStepCount.inc({
         template,
         step: step.name,
         result: 'ok',
       });
       stepTimer({ result: 'ok' });
+
+      stepCount.add(1, { template, step: step.name, result: 'ok' });
+      stepDuration.record(endTime(), {
+        result: 'ok',
+      });
     }
 
     async function markCancelled() {
-      stepCount.inc({
+      promtStepCount.inc({
         template,
         step: step.name,
         result: 'cancelled',
       });
       stepTimer({ result: 'cancelled' });
+
+      stepCount.add(1, { template, step: step.name, result: 'cancelled' });
+      stepDuration.record(endTime(), {
+        result: 'cancelled',
+      });
     }
 
     async function markFailed() {
-      stepCount.inc({
+      promtStepCount.inc({
         template,
         step: step.name,
         result: 'failed',
       });
       stepTimer({ result: 'failed' });
+
+      stepCount.add(1, { template, step: step.name, result: 'failed' });
+      stepDuration.record(endTime(), {
+        result: 'failed',
+      });
     }
 
     async function skipFalsy() {
@@ -587,6 +733,11 @@ function scaffoldingTracker() {
         { stepId: step.id, status: 'skipped' },
       );
       stepTimer({ result: 'skipped' });
+
+      stepCount.add(1, { template, step: step.name, result: 'skipped' });
+      stepDuration.record(endTime(), {
+        result: 'skipped',
+      });
     }
 
     return {

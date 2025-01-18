@@ -36,8 +36,9 @@ import {
 import { setupServer } from 'msw/node';
 import {
   ServiceMock,
+  mockCredentials,
   mockServices,
-  setupRequestMockHandlers,
+  registerMswTestHooks,
   startTestBackend,
 } from '@backstage/backend-test-utils';
 import { rest } from 'msw';
@@ -55,7 +56,7 @@ import {
   kubernetesFetcherExtensionPoint,
   kubernetesServiceLocatorExtensionPoint,
 } from '@backstage/plugin-kubernetes-node';
-import { ExtendedHttpServer } from '@backstage/backend-app-api';
+import { ExtendedHttpServer } from '@backstage/backend-defaults/rootHttpRouter';
 
 describe('API integration tests', () => {
   let app: ExtendedHttpServer;
@@ -120,8 +121,8 @@ describe('API integration tests', () => {
     const { server } = await startTestBackend({
       features: [
         minimalValidConfigService,
-        import('@backstage/plugin-kubernetes-backend/alpha'),
-        import('@backstage/plugin-permission-backend/alpha'),
+        import('@backstage/plugin-kubernetes-backend'),
+        import('@backstage/plugin-permission-backend'),
         import('@backstage/plugin-permission-backend-module-allow-all-policy'),
         createBackendModule({
           pluginId: 'kubernetes',
@@ -186,7 +187,7 @@ describe('API integration tests', () => {
       const { server } = await startTestBackend({
         features: [
           minimalValidConfigService,
-          import('@backstage/plugin-kubernetes-backend/alpha'),
+          import('@backstage/plugin-kubernetes-backend'),
           createBackendModule({
             pluginId: 'kubernetes',
             moduleId: 'testObjectsProvider',
@@ -278,6 +279,32 @@ describe('API integration tests', () => {
         ],
       });
     });
+
+    it('surfaces cluster title', async () => {
+      const { server } = await startTestBackend({
+        features: [
+          minimalValidConfigService,
+          import('@backstage/plugin-kubernetes-backend'),
+          withClusters([
+            {
+              name: 'cluster-name',
+              title: 'cluster-title',
+              url: 'url',
+              authMetadata: {
+                [ANNOTATION_KUBERNETES_AUTH_PROVIDER]: 'serviceAccount',
+              },
+            },
+          ]),
+        ],
+      });
+      app = server;
+
+      const response = await request(app).get('/api/kubernetes/clusters');
+
+      expect(response.body).toEqual({
+        items: [expect.objectContaining({ title: 'cluster-title' })],
+      });
+    });
   });
 
   describe('post /services/:serviceId', () => {
@@ -350,7 +377,7 @@ describe('API integration tests', () => {
       const { server } = await startTestBackend({
         features: [
           minimalValidConfigService,
-          import('@backstage/plugin-kubernetes-backend/alpha'),
+          import('@backstage/plugin-kubernetes-backend'),
           withClusters(clusters),
           createBackendModule({
             pluginId: 'kubernetes',
@@ -413,7 +440,7 @@ describe('API integration tests', () => {
       const { server } = await startTestBackend({
         features: [
           minimalValidConfigService,
-          import('@backstage/plugin-kubernetes-backend/alpha'),
+          import('@backstage/plugin-kubernetes-backend'),
           withClusters([
             {
               name: 'custom-cluster',
@@ -481,7 +508,7 @@ describe('API integration tests', () => {
 
   describe('/proxy', () => {
     const worker = setupServer();
-    setupRequestMockHandlers(worker);
+    registerMswTestHooks(worker);
 
     beforeEach(() => {
       worker.use(
@@ -552,7 +579,7 @@ metadata:
         features: [
           minimalValidConfigService,
           permissionsMock.factory,
-          import('@backstage/plugin-kubernetes-backend/alpha'),
+          import('@backstage/plugin-kubernetes-backend'),
         ],
       });
       app = server;
@@ -587,7 +614,7 @@ metadata:
       const { server } = await startTestBackend({
         features: [
           minimalValidConfigService,
-          import('@backstage/plugin-kubernetes-backend/alpha'),
+          import('@backstage/plugin-kubernetes-backend'),
           withClusters([
             {
               name: 'custom-cluster',
@@ -662,7 +689,7 @@ metadata:
               },
             },
           }),
-          import('@backstage/plugin-kubernetes-backend/alpha'),
+          import('@backstage/plugin-kubernetes-backend'),
           createBackendModule({
             pluginId: 'kubernetes',
             moduleId: 'testAuthStrategy',
@@ -701,7 +728,20 @@ metadata:
     const throwError = () =>
       startTestBackend({
         features: [
-          import('@backstage/plugin-kubernetes-backend/alpha'),
+          mockServices.rootConfig.factory({
+            data: {
+              kubernetes: {
+                serviceLocatorMethod: { type: 'multiTenant' },
+                clusterLocatorMethods: [
+                  {
+                    type: 'config',
+                    clusters: [],
+                  },
+                ],
+              },
+            },
+          }),
+          import('@backstage/plugin-kubernetes-backend'),
           createBackendModule({
             pluginId: 'kubernetes',
             moduleId: 'testAuthStrategy',
@@ -731,9 +771,9 @@ metadata:
   });
 
   it('serves permission integration endpoint', async () => {
-    const response = await request(app).get(
-      '/api/kubernetes/.well-known/backstage/permissions/metadata',
-    );
+    const response = await request(app)
+      .get('/api/kubernetes/.well-known/backstage/permissions/metadata')
+      .set('authorization', mockCredentials.service.header());
 
     expect(response.status).toEqual(200);
     expect(response.body).toMatchObject({
@@ -756,7 +796,7 @@ metadata:
               },
             },
           }),
-          import('@backstage/plugin-kubernetes-backend/alpha'),
+          import('@backstage/plugin-kubernetes-backend'),
         ],
       }),
     ).rejects.toThrow(

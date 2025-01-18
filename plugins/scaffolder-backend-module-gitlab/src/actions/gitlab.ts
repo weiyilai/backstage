@@ -17,7 +17,7 @@
 import { InputError } from '@backstage/errors';
 import { ScmIntegrationRegistry } from '@backstage/integration';
 import { createTemplateAction } from '@backstage/plugin-scaffolder-node';
-import { Gitlab } from '@gitbeaker/node';
+import { Gitlab, VariableType } from '@gitbeaker/rest';
 import {
   initRepoAndPush,
   getRepoSourceDirectory,
@@ -56,8 +56,13 @@ export function createPublishGitlabAction(options: {
       auto_devops_enabled?: boolean;
       ci_config_path?: string;
       description?: string;
+      merge_method?: 'merge' | 'rebase_merge' | 'ff';
+      squash_option?: 'default_off' | 'default_on' | 'never' | 'always';
       topics?: string[];
       visibility?: 'private' | 'internal' | 'public';
+      only_allow_merge_if_all_discussions_are_resolved?: boolean;
+      only_allow_merge_if_pipeline_succeeds?: boolean;
+      allow_merge_on_skipped_pipeline?: boolean;
     };
     branches?: Array<{
       name: string;
@@ -169,6 +174,19 @@ export function createPublishGitlabAction(options: {
                 description: 'Short project description',
                 type: 'string',
               },
+              merge_method: {
+                title: 'Merge Method to use',
+                description: 'Merge Methods (merge, rebase_merge, ff)',
+                type: 'string',
+                enum: ['merge', 'rebase_merge', 'ff'],
+              },
+              squash_option: {
+                title: 'Squash option',
+                description:
+                  'Set squash option for the project (never, always, default_on, default_off)',
+                type: 'string',
+                enum: ['default_off', 'default_on', 'never', 'always'],
+              },
               topics: {
                 title: 'Topic labels',
                 description: 'Topic labels to apply on the repository',
@@ -183,6 +201,24 @@ export function createPublishGitlabAction(options: {
                   'The visibility of the project. Can be private, internal, or public. The default value is private.',
                 type: 'string',
                 enum: ['private', 'public', 'internal'],
+              },
+              only_allow_merge_if_all_discussions_are_resolved: {
+                title: 'All threads must be resolved',
+                description:
+                  'Set whether merge requests can only be merged when all the discussions are resolved.',
+                type: 'boolean',
+              },
+              only_allow_merge_if_pipeline_succeeds: {
+                title: 'Pipelines must succeed',
+                description:
+                  'Set whether merge requests can only be merged with successful pipelines. This setting is named Pipelines must succeed in the project settings.',
+                type: 'boolean',
+              },
+              allow_merge_on_skipped_pipeline: {
+                title: 'Skipped pipelines are considered successful',
+                description:
+                  'Set whether or not merge requests can be merged with skipped jobs.',
+                type: 'boolean',
               },
             },
           },
@@ -279,7 +315,7 @@ export function createPublishGitlabAction(options: {
           },
           projectId: {
             title: 'The ID of the project',
-            type: 'string',
+            type: 'number',
           },
           commitHash: {
             title: 'The git commit hash of the initial commit',
@@ -347,7 +383,7 @@ export function createPublishGitlabAction(options: {
         throw e;
       }
 
-      const { id: userId } = (await client.Users.current()) as {
+      const { id: userId } = (await client.Users.showCurrentUser()) as {
         id: number;
       };
 
@@ -356,7 +392,7 @@ export function createPublishGitlabAction(options: {
       }
 
       const { id: projectId, http_url_to_repo } = await client.Projects.create({
-        namespace_id: targetNamespaceId,
+        namespaceId: targetNamespaceId,
         name: repo,
         visibility: repoVisibility,
         ...(topics.length ? { topics } : {}),
@@ -442,7 +478,8 @@ export function createPublishGitlabAction(options: {
       if (projectVariables) {
         for (const variable of projectVariables) {
           const variableWithDefaults = Object.assign(variable, {
-            variable_type: variable.variable_type ?? 'env_var',
+            variable_type: (variable.variable_type ??
+              'env_var') as VariableType,
             protected: variable.protected ?? false,
             masked: variable.masked ?? false,
             raw: variable.raw ?? false,
@@ -452,7 +489,16 @@ export function createPublishGitlabAction(options: {
           try {
             await client.ProjectVariables.create(
               projectId,
-              variableWithDefaults,
+              variableWithDefaults.key,
+              variableWithDefaults.value,
+              {
+                variableType: variableWithDefaults.variable_type,
+                protected: variableWithDefaults.protected,
+                masked: variableWithDefaults.masked,
+                environmentScope: variableWithDefaults.environment_scope,
+                description: variableWithDefaults.description,
+                raw: variableWithDefaults.raw,
+              },
             );
           } catch (e) {
             throw new InputError(

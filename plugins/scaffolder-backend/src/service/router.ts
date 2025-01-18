@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
-import { PluginDatabaseManager, UrlReader } from '@backstage/backend-common';
-import { PluginTaskScheduler } from '@backstage/backend-tasks';
+import {
+  createLegacyAuthAdapters,
+  HostDiscovery,
+} from '@backstage/backend-common';
 import { CatalogApi } from '@backstage/catalog-client';
 import {
   CompoundEntityRef,
@@ -30,16 +32,20 @@ import { ScmIntegrations } from '@backstage/integration';
 import { HumanDuration, JsonObject, JsonValue } from '@backstage/types';
 import {
   TaskSpec,
+  TemplateEntityStepV1beta3,
   TemplateEntityV1beta3,
   templateEntityV1beta3Validator,
   TemplateParametersV1beta3,
-  TemplateEntityStepV1beta3,
 } from '@backstage/plugin-scaffolder-common';
 import {
   RESOURCE_TYPE_SCAFFOLDER_ACTION,
   RESOURCE_TYPE_SCAFFOLDER_TEMPLATE,
   scaffolderActionPermissions,
+  scaffolderPermissions,
   scaffolderTemplatePermissions,
+  taskCancelPermission,
+  taskCreatePermission,
+  taskReadPermission,
   templateParameterReadPermission,
   templateStepReadPermission,
 } from '@backstage/plugin-scaffolder-common/alpha';
@@ -50,6 +56,8 @@ import { Logger } from 'winston';
 import { z } from 'zod';
 import {
   TaskBroker,
+  TaskStatus,
+  TemplateAction,
   TemplateFilter,
   TemplateGlobal,
 } from '@backstage/plugin-scaffolder-node';
@@ -61,16 +69,14 @@ import {
 } from '../scaffolder';
 import { createDryRunner } from '../scaffolder/dryrun';
 import { StorageTaskBroker } from '../scaffolder/tasks/StorageTaskBroker';
-import { findTemplate, getEntityBaseUrl, getWorkingDirectory } from './helpers';
 import {
-  IdentityApi,
-  IdentityApiGetIdentityRequest,
-} from '@backstage/plugin-auth-node';
-import { TemplateAction } from '@backstage/plugin-scaffolder-node';
-import {
-  PermissionEvaluator,
-  PermissionRuleParams,
-} from '@backstage/plugin-permission-common';
+  findTemplate,
+  getEntityBaseUrl,
+  getWorkingDirectory,
+  parseNumberParam,
+  parseStringsParam,
+} from './helpers';
+import { PermissionRuleParams } from '@backstage/plugin-permission-common';
 import {
   createConditionAuthorizer,
   createPermissionIntegrationRouter,
@@ -78,7 +84,31 @@ import {
 } from '@backstage/plugin-permission-node';
 import { scaffolderActionRules, scaffolderTemplateRules } from './rules';
 import { Duration } from 'luxon';
-import { LifecycleService } from '@backstage/backend-plugin-api';
+import {
+  AuthService,
+  BackstageCredentials,
+  DatabaseService,
+  DiscoveryService,
+  HttpAuthService,
+  LifecycleService,
+  PermissionsService,
+  resolveSafeChildPath,
+  SchedulerService,
+  UrlReaderService,
+} from '@backstage/backend-plugin-api';
+import {
+  IdentityApi,
+  IdentityApiGetIdentityRequest,
+} from '@backstage/plugin-auth-node';
+import { InternalTaskSecrets } from '../scaffolder/tasks/types';
+import { checkPermission } from '../util/checkPermissions';
+import {
+  AutocompleteHandler,
+  WorkspaceProvider,
+} from '@backstage/plugin-scaffolder-node/alpha';
+import { pathToFileURL } from 'url';
+import { v4 as uuid } from 'uuid';
+import { EventsService } from '@backstage/plugin-events-node';
 
 /**
  *
@@ -120,15 +150,16 @@ function isActionPermissionRuleInput(
  * RouterOptions
  *
  * @public
+ * @deprecated Please migrate to the new backend system as this will be removed in the future.
  */
 export interface RouterOptions {
   logger: Logger;
   config: Config;
-  reader: UrlReader;
+  reader: UrlReaderService;
   lifecycle?: LifecycleService;
-  database: PluginDatabaseManager;
+  database: DatabaseService;
   catalogClient: CatalogApi;
-  scheduler?: PluginTaskScheduler;
+  scheduler?: SchedulerService;
   actions?: TemplateAction<any, any>[];
   /**
    * @deprecated taskWorkers is deprecated in favor of concurrentTasksLimit option with a single TaskWorker
@@ -143,11 +174,18 @@ export interface RouterOptions {
   taskBroker?: TaskBroker;
   additionalTemplateFilters?: Record<string, TemplateFilter>;
   additionalTemplateGlobals?: Record<string, TemplateGlobal>;
-  permissions?: PermissionEvaluator;
+  additionalWorkspaceProviders?: Record<string, WorkspaceProvider>;
+  permissions?: PermissionsService;
   permissionRules?: Array<
     TemplatePermissionRuleInput | ActionPermissionRuleInput
   >;
+  auth?: AuthService;
+  httpAuth?: HttpAuthService;
   identity?: IdentityApi;
+  discovery?: DiscoveryService;
+  events?: EventsService;
+
+  autocompleteHandlers?: Record<string, AutocompleteHandler>;
 }
 
 function isSupportedTemplate(entity: TemplateEntityV1beta3) {
@@ -232,6 +270,7 @@ const readDuration = (
 /**
  * A method to create a router for the scaffolder backend plugin.
  * @public
+ * @deprecated Please migrate to the new backend system as this will be removed in the future.
  */
 export async function createRouter(
   options: RouterOptions,
@@ -251,24 +290,43 @@ export async function createRouter(
     scheduler,
     additionalTemplateFilters,
     additionalTemplateGlobals,
+    additionalWorkspaceProviders,
     permissions,
     permissionRules,
+    discovery = HostDiscovery.fromConfig(config),
+    identity = buildDefaultIdentityClient(options),
+    autocompleteHandlers = {},
+    events: eventsService,
   } = options;
+
+  const { auth, httpAuth } = createLegacyAuthAdapters({
+    ...options,
+    identity,
+    discovery,
+  });
+
   const concurrentTasksLimit =
     options.concurrentTasksLimit ??
     options.config.getOptionalNumber('scaffolder.concurrentTasksLimit');
 
   const logger = parentLogger.child({ plugin: 'scaffolder' });
 
-  const identity: IdentityApi =
-    options.identity || buildDefaultIdentityClient(options);
   const workingDirectory = await getWorkingDirectory(config, logger);
   const integrations = ScmIntegrations.fromConfig(config);
 
   let taskBroker: TaskBroker;
   if (!options.taskBroker) {
-    const databaseTaskStore = await DatabaseTaskStore.create({ database });
-    taskBroker = new StorageTaskBroker(databaseTaskStore, logger, config);
+    const databaseTaskStore = await DatabaseTaskStore.create({
+      database,
+      events: eventsService,
+    });
+    taskBroker = new StorageTaskBroker(
+      databaseTaskStore,
+      logger,
+      config,
+      auth,
+      additionalWorkspaceProviders,
+    );
 
     if (scheduler && databaseTaskStore.listStaleTasks) {
       await scheduler.scheduleTask({
@@ -330,6 +388,7 @@ export async function createRouter(
         config,
         additionalTemplateFilters,
         additionalTemplateGlobals,
+        auth,
       });
 
   actionsToRegister.forEach(action => actionRegistry.register(action));
@@ -386,6 +445,7 @@ export async function createRouter(
         rules: actionRules,
       },
     ],
+    permissions: scaffolderPermissions,
   });
 
   router.use(permissionIntegrationRouter);
@@ -394,12 +454,18 @@ export async function createRouter(
     .get(
       '/v2/templates/:namespace/:kind/:name/parameter-schema',
       async (req, res) => {
-        const userIdentity = await identity.getIdentity({
-          request: req,
-        });
-        const token = userIdentity?.token;
+        const credentials = await httpAuth.credentials(req);
 
-        const template = await authorizeTemplate(req.params, token);
+        const { token } = await auth.getPluginRequestToken({
+          onBehalfOf: credentials,
+          targetPluginId: 'catalog',
+        });
+
+        const template = await authorizeTemplate(
+          req.params,
+          token,
+          credentials,
+        );
 
         const parameters = [template.spec.parameters ?? []].flat();
 
@@ -415,6 +481,8 @@ export async function createRouter(
             description: schema.description,
             schema,
           })),
+          EXPERIMENTAL_formDecorators:
+            template.spec.EXPERIMENTAL_formDecorators,
         });
       },
     )
@@ -435,11 +503,22 @@ export async function createRouter(
         defaultKind: 'template',
       });
 
-      const callerIdentity = await identity.getIdentity({
-        request: req,
+      const credentials = await httpAuth.credentials(req);
+
+      await checkPermission({
+        credentials,
+        permissions: [taskCreatePermission],
+        permissionService: permissions,
       });
-      const token = callerIdentity?.token;
-      const userEntityRef = callerIdentity?.identity.userEntityRef;
+
+      const { token } = await auth.getPluginRequestToken({
+        onBehalfOf: credentials,
+        targetPluginId: 'catalog',
+      });
+
+      const userEntityRef = auth.isPrincipal(credentials, 'user')
+        ? credentials.principal.userEntityRef
+        : undefined;
 
       const userEntity = userEntityRef
         ? await catalogClient.getEntityByRef(userEntityRef, { token })
@@ -456,6 +535,7 @@ export async function createRouter(
       const template = await authorizeTemplate(
         { kind, namespace, name },
         token,
+        credentials,
       );
 
       for (const parameters of [template.spec.parameters ?? []].flat()) {
@@ -492,26 +572,31 @@ export async function createRouter(
         },
       };
 
+      const secrets: InternalTaskSecrets = {
+        ...req.body.secrets,
+        backstageToken: token,
+        __initiatorCredentials: JSON.stringify({
+          ...credentials,
+          // credentials.token is nonenumerable and will not be serialized, so we need to add it explicitly
+          token: (credentials as any).token,
+        }),
+      };
+
       const result = await taskBroker.dispatch({
         spec: taskSpec,
         createdBy: userEntityRef,
-        secrets: {
-          ...req.body.secrets,
-          backstageToken: token,
-        },
+        secrets,
       });
 
       res.status(201).json({ id: result.taskId });
     })
     .get('/v2/tasks', async (req, res) => {
-      const [userEntityRef] = [req.query.createdBy].flat();
-
-      if (
-        typeof userEntityRef !== 'string' &&
-        typeof userEntityRef !== 'undefined'
-      ) {
-        throw new InputError('createdBy query parameter must be a string');
-      }
+      const credentials = await httpAuth.credentials(req);
+      await checkPermission({
+        credentials,
+        permissions: [taskReadPermission],
+        permissionService: permissions,
+      });
 
       if (!taskBroker.list) {
         throw new Error(
@@ -519,13 +604,48 @@ export async function createRouter(
         );
       }
 
+      const createdBy = parseStringsParam(req.query.createdBy, 'createdBy');
+      const status = parseStringsParam(req.query.status, 'status');
+
+      const order = parseStringsParam(req.query.order, 'order')?.map(item => {
+        const match = item.match(/^(asc|desc):(.+)$/);
+        if (!match) {
+          throw new InputError(
+            `Invalid order parameter "${item}", expected "<asc or desc>:<field name>"`,
+          );
+        }
+
+        return {
+          order: match[1] as 'asc' | 'desc',
+          field: match[2],
+        };
+      });
+
+      const limit = parseNumberParam(req.query.limit, 'limit');
+      const offset = parseNumberParam(req.query.offset, 'offset');
+
       const tasks = await taskBroker.list({
-        createdBy: userEntityRef,
+        filters: {
+          createdBy,
+          status: status ? (status as TaskStatus[]) : undefined,
+        },
+        order,
+        pagination: {
+          limit: limit ? limit[0] : undefined,
+          offset: offset ? offset[0] : undefined,
+        },
       });
 
       res.status(200).json(tasks);
     })
     .get('/v2/tasks/:taskId', async (req, res) => {
+      const credentials = await httpAuth.credentials(req);
+      await checkPermission({
+        credentials,
+        permissions: [taskReadPermission],
+        permissionService: permissions,
+      });
+
       const { taskId } = req.params;
       const task = await taskBroker.get(taskId);
       if (!task) {
@@ -536,11 +656,39 @@ export async function createRouter(
       res.status(200).json(task);
     })
     .post('/v2/tasks/:taskId/cancel', async (req, res) => {
+      const credentials = await httpAuth.credentials(req);
+      // Requires both read and cancel permissions
+      await checkPermission({
+        credentials,
+        permissions: [taskCancelPermission, taskReadPermission],
+        permissionService: permissions,
+      });
+
       const { taskId } = req.params;
       await taskBroker.cancel?.(taskId);
       res.status(200).json({ status: 'cancelled' });
     })
+    .post('/v2/tasks/:taskId/retry', async (req, res) => {
+      const credentials = await httpAuth.credentials(req);
+      // Requires both read and cancel permissions
+      await checkPermission({
+        credentials,
+        permissions: [taskCreatePermission, taskReadPermission],
+        permissionService: permissions,
+      });
+
+      const { taskId } = req.params;
+      await taskBroker.retry?.(taskId);
+      res.status(201).json({ id: taskId });
+    })
     .get('/v2/tasks/:taskId/eventstream', async (req, res) => {
+      const credentials = await httpAuth.credentials(req);
+      await checkPermission({
+        credentials,
+        permissions: [taskReadPermission],
+        permissionService: permissions,
+      });
+
       const { taskId } = req.params;
       const after =
         req.query.after !== undefined ? Number(req.query.after) : undefined;
@@ -568,7 +716,7 @@ export async function createRouter(
             res.write(
               `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
             );
-            if (event.type === 'completion') {
+            if (event.type === 'completion' && !event.isTaskRecoverable) {
               shouldUnsubscribe = true;
             }
           }
@@ -589,6 +737,13 @@ export async function createRouter(
       });
     })
     .get('/v2/tasks/:taskId/events', async (req, res) => {
+      const credentials = await httpAuth.credentials(req);
+      await checkPermission({
+        credentials,
+        permissions: [taskReadPermission],
+        permissionService: permissions,
+      });
+
       const { taskId } = req.params;
       const after = Number(req.query.after) || undefined;
 
@@ -619,6 +774,13 @@ export async function createRouter(
       });
     })
     .post('/v2/dry-run', async (req, res) => {
+      const credentials = await httpAuth.credentials(req);
+      await checkPermission({
+        credentials,
+        permissions: [taskCreatePermission],
+        permissionService: permissions,
+      });
+
       const bodySchema = z.object({
         template: z.unknown(),
         values: z.record(z.unknown()),
@@ -636,11 +798,18 @@ export async function createRouter(
         throw new InputError('Input template is not a template');
       }
 
-      const token = (
-        await identity.getIdentity({
-          request: req,
-        })
-      )?.token;
+      const { token } = await auth.getPluginRequestToken({
+        onBehalfOf: credentials,
+        targetPluginId: 'catalog',
+      });
+
+      const userEntityRef = auth.isPrincipal(credentials, 'user')
+        ? credentials.principal.userEntityRef
+        : undefined;
+
+      const userEntity = userEntityRef
+        ? await catalogClient.getEntityByRef(userEntityRef, { token })
+        : undefined;
 
       for (const parameters of [template.spec.parameters ?? []].flat()) {
         const result = validate(body.values, parameters);
@@ -656,13 +825,34 @@ export async function createRouter(
         name: step.name ?? step.action,
       }));
 
+      const dryRunId = uuid();
+      const contentsPath = resolveSafeChildPath(
+        workingDirectory,
+        `dry-run-content-${dryRunId}`,
+      );
+
+      const templateInfo = {
+        entityRef: stringifyEntityRef(template),
+        entity: {
+          metadata: template.metadata,
+        },
+        baseUrl: pathToFileURL(
+          resolveSafeChildPath(contentsPath, 'template.yaml'),
+        ).toString(),
+      };
+
       const result = await dryRunner({
         spec: {
           apiVersion: template.apiVersion,
           steps,
           output: template.spec.output ?? {},
           parameters: body.values as JsonObject,
+          user: {
+            entity: userEntity as UserEntity,
+            ref: userEntityRef,
+          },
         },
+        templateInfo: templateInfo,
         directoryContents: (body.directoryContents ?? []).map(file => ({
           path: file.path,
           content: Buffer.from(file.base64Content, 'base64'),
@@ -671,6 +861,7 @@ export async function createRouter(
           ...body.secrets,
           ...(token && { backstageToken: token }),
         },
+        credentials,
       });
 
       res.status(200).json({
@@ -682,6 +873,24 @@ export async function createRouter(
           base64Content: file.content.toString('base64'),
         })),
       });
+    })
+    .post('/v2/autocomplete/:provider/:resource', async (req, res) => {
+      const { token, context } = req.body;
+      const { provider, resource } = req.params;
+
+      if (!token) throw new InputError('Missing token query parameter');
+
+      if (!autocompleteHandlers[provider]) {
+        throw new InputError(`Unsupported provider: ${provider}`);
+      }
+
+      const { results } = await autocompleteHandlers[provider]({
+        resource,
+        token,
+        context,
+      });
+
+      res.status(200).json({ results });
     });
 
   const app = express();
@@ -691,6 +900,7 @@ export async function createRouter(
   async function authorizeTemplate(
     entityRef: CompoundEntityRef,
     token: string | undefined,
+    credentials: BackstageCredentials,
   ) {
     const template = await findTemplate({
       catalogApi: catalogClient,
@@ -716,7 +926,7 @@ export async function createRouter(
           { permission: templateParameterReadPermission },
           { permission: templateStepReadPermission },
         ],
-        { token },
+        { credentials },
       );
 
     // Authorize parameters

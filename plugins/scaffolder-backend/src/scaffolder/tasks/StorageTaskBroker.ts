@@ -16,8 +16,12 @@
 
 import { Config } from '@backstage/config';
 import { TaskSpec } from '@backstage/plugin-scaffolder-common';
-import { TaskSecrets } from '@backstage/plugin-scaffolder-node';
-import { JsonObject, Observable } from '@backstage/types';
+import {
+  JsonObject,
+  JsonValue,
+  Observable,
+  createDeferred,
+} from '@backstage/types';
 import { Logger } from 'winston';
 import ObservableImpl from 'zen-observable';
 import {
@@ -27,10 +31,31 @@ import {
   TaskBrokerDispatchOptions,
   TaskCompletionState,
   TaskContext,
-  TaskStore,
-} from './types';
+  TaskSecrets,
+  TaskStatus,
+} from '@backstage/plugin-scaffolder-node';
+import { InternalTaskSecrets, TaskStore } from './types';
 import { readDuration } from './helper';
+import {
+  AuthService,
+  BackstageCredentials,
+} from '@backstage/backend-plugin-api';
+import { DefaultWorkspaceService, WorkspaceService } from './WorkspaceService';
+import { WorkspaceProvider } from '@backstage/plugin-scaffolder-node/alpha';
 
+type TaskState = {
+  checkpoints: {
+    [key: string]:
+      | {
+          status: 'failed';
+          reason: string;
+        }
+      | {
+          status: 'success';
+          value: JsonValue;
+        };
+  };
+};
 /**
  * TaskManager
  *
@@ -46,8 +71,25 @@ export class TaskManager implements TaskContext {
     storage: TaskStore,
     abortSignal: AbortSignal,
     logger: Logger,
+    auth?: AuthService,
+    config?: Config,
+    additionalWorkspaceProviders?: Record<string, WorkspaceProvider>,
   ) {
-    const agent = new TaskManager(task, storage, abortSignal, logger);
+    const workspaceService = DefaultWorkspaceService.create(
+      task,
+      storage,
+      additionalWorkspaceProviders,
+      config,
+    );
+
+    const agent = new TaskManager(
+      task,
+      storage,
+      abortSignal,
+      logger,
+      workspaceService,
+      auth,
+    );
     agent.startTimeout();
     return agent;
   }
@@ -58,6 +100,8 @@ export class TaskManager implements TaskContext {
     private readonly storage: TaskStore,
     private readonly signal: AbortSignal,
     private readonly logger: Logger,
+    private readonly workspaceService: WorkspaceService,
+    private readonly auth?: AuthService,
   ) {}
 
   get spec() {
@@ -80,6 +124,13 @@ export class TaskManager implements TaskContext {
     return this.task.taskId;
   }
 
+  async rehydrateWorkspace?(options: {
+    taskId: string;
+    targetPath: string;
+  }): Promise<void> {
+    await this.workspaceService.rehydrateWorkspace(options);
+  }
+
   get done() {
     return this.isDone;
   }
@@ -89,6 +140,48 @@ export class TaskManager implements TaskContext {
       taskId: this.task.taskId,
       body: { message, ...logMetadata },
     });
+  }
+
+  async getTaskState?(): Promise<
+    | {
+        state?: JsonObject;
+      }
+    | undefined
+  > {
+    return this.storage.getTaskState?.({ taskId: this.task.taskId });
+  }
+
+  async updateCheckpoint?(
+    options:
+      | {
+          key: string;
+          status: 'success';
+          value: JsonValue;
+        }
+      | {
+          key: string;
+          status: 'failed';
+          reason: string;
+        },
+  ): Promise<void> {
+    const { key, ...value } = options;
+    if (this.task.state) {
+      (this.task.state as TaskState).checkpoints[key] = value;
+    } else {
+      this.task.state = { checkpoints: { [key]: value } };
+    }
+    await this.storage.saveTaskState?.({
+      taskId: this.task.taskId,
+      state: this.task.state,
+    });
+  }
+
+  async serializeWorkspace?(options: { path: string }): Promise<void> {
+    await this.workspaceService.serializeWorkspace(options);
+  }
+
+  async cleanWorkspace?(): Promise<void> {
+    await this.workspaceService.cleanWorkspace();
   }
 
   async complete(
@@ -124,6 +217,20 @@ export class TaskManager implements TaskContext {
       }
     }, 1000);
   }
+
+  async getInitiatorCredentials(): Promise<BackstageCredentials> {
+    const secrets = this.task.secrets as InternalTaskSecrets;
+
+    if (secrets && secrets.__initiatorCredentials) {
+      return JSON.parse(secrets.__initiatorCredentials);
+    }
+    if (!this.auth) {
+      throw new Error(
+        'Failed to create none credentials in scaffolder task. The TaskManager has not been initialized with an auth service implementation',
+      );
+    }
+    return this.auth.getNoneCredentials();
+  }
 }
 
 /**
@@ -145,17 +252,17 @@ export interface CurrentClaimedTask {
    */
   secrets?: TaskSecrets;
   /**
+   * The state of checkpoints of the task.
+   */
+  state?: JsonObject;
+  /**
    * The creator of the task.
    */
   createdBy?: string;
-}
-
-function defer() {
-  let resolve = () => {};
-  const promise = new Promise<void>(_resolve => {
-    resolve = _resolve;
-  });
-  return { promise, resolve };
+  /**
+   * The workspace of the task.
+   */
+  workspace?: Promise<Buffer>;
 }
 
 export class StorageTaskBroker implements TaskBroker {
@@ -163,20 +270,35 @@ export class StorageTaskBroker implements TaskBroker {
     private readonly storage: TaskStore,
     private readonly logger: Logger,
     private readonly config?: Config,
+    private readonly auth?: AuthService,
+    private readonly additionalWorkspaceProviders?: Record<
+      string,
+      WorkspaceProvider
+    >,
   ) {}
 
   async list(options?: {
     createdBy?: string;
-  }): Promise<{ tasks: SerializedTask[] }> {
+    status?: TaskStatus;
+    filters?: {
+      createdBy?: string | string[];
+      status?: TaskStatus | TaskStatus[];
+    };
+    pagination?: {
+      limit?: number;
+      offset?: number;
+    };
+    order?: { order: 'asc' | 'desc'; field: string }[];
+  }): Promise<{ tasks: SerializedTask[]; totalTasks?: number }> {
     if (!this.storage.list) {
       throw new Error(
         'TaskStore does not implement the list method. Please implement the list method to be able to list tasks',
       );
     }
-    return await this.storage.list({ createdBy: options?.createdBy });
+    return await this.storage.list(options ?? {});
   }
 
-  private deferredDispatch = defer();
+  private deferredDispatch = createDeferred();
 
   private async registerCancellable(
     taskId: string,
@@ -194,7 +316,7 @@ export class StorageTaskBroker implements TaskBroker {
             shouldUnsubscribe = true;
           }
 
-          if (event.type === 'completion') {
+          if (event.type === 'completion' && !event.isTaskRecoverable) {
             shouldUnsubscribe = true;
           }
         }
@@ -244,10 +366,14 @@ export class StorageTaskBroker implements TaskBroker {
             spec: pendingTask.spec,
             secrets: pendingTask.secrets,
             createdBy: pendingTask.createdBy,
+            state: pendingTask.state,
           },
           this.storage,
           abortController.signal,
           this.logger,
+          this.auth,
+          this.config,
+          this.additionalWorkspaceProviders,
         );
       }
 
@@ -289,8 +415,17 @@ export class StorageTaskBroker implements TaskBroker {
       let cancelled = false;
 
       (async () => {
+        const task = await this.storage.getTask(taskId);
+        const isTaskRecoverable =
+          task.spec.EXPERIMENTAL_recovery?.EXPERIMENTAL_strategy ===
+          'startOver';
+
         while (!cancelled) {
-          const result = await this.storage.listEvents({ taskId, after });
+          const result = await this.storage.listEvents({
+            isTaskRecoverable,
+            taskId,
+            after,
+          });
           const { events } = result;
           if (events.length) {
             after = events[events.length - 1].id;
@@ -331,12 +466,12 @@ export class StorageTaskBroker implements TaskBroker {
   }
 
   private waitForDispatch() {
-    return this.deferredDispatch.promise;
+    return this.deferredDispatch;
   }
 
   private signalDispatch() {
     this.deferredDispatch.resolve();
-    this.deferredDispatch = defer();
+    this.deferredDispatch = createDeferred();
   }
 
   async cancel(taskId: string) {
@@ -357,5 +492,10 @@ export class StorageTaskBroker implements TaskBroker {
         status: 'cancelled',
       },
     });
+  }
+
+  async retry?(taskId: string): Promise<void> {
+    await this.storage.retryTask?.({ taskId });
+    this.signalDispatch();
   }
 }
